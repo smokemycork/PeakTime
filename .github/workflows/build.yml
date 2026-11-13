@@ -1,0 +1,83 @@
+name: Build PeakTime installers
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  engine-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: DSP engine tests
+        run: |
+          g++ -std=c++17 -O2 -ISource tests/engine_test.cpp Source/dsp/IRGenerator.cpp Source/dsp/VenueEngine.cpp -o engine_test
+          ./engine_test
+
+  macos:
+    needs: engine-tests
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version
+        id: ver
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then V="${GITHUB_REF#refs/tags/v}";
+          else V=$(sed -nE 's/^project\(PeakTime VERSION ([0-9.]+).*/\1/p' CMakeLists.txt); fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+      - name: "Configure (universal - Apple Silicon + Intel)"
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+      - name: Build VST3, AU, Standalone
+        run: cmake --build build --config Release -j 4
+      - name: Make installer (.pkg)
+        run: bash installer/mac/build_pkg.sh "${{ steps.ver.outputs.version }}" build/PeakTime_artefacts/Release dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PeakTime-macOS
+          path: dist/*.pkg
+
+  windows:
+    needs: engine-tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version
+        id: ver
+        shell: pwsh
+        run: |
+          if ("$env:GITHUB_REF" -like "refs/tags/v*") { $v = "$env:GITHUB_REF".Substring(11) }
+          else { $v = (Select-String -Path CMakeLists.txt -Pattern 'project\(PeakTime VERSION ([0-9.]+)').Matches[0].Groups[1].Value }
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+      - name: Configure
+        run: cmake -B build -A x64
+      - name: Build VST3 + Standalone
+        run: cmake --build build --config Release --parallel 4
+      - name: Make installer (.exe)
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc "/DMyAppVersion=${{ steps.ver.outputs.version }}" "/DArtefactsDir=$pwd\build\PeakTime_artefacts\Release" "/O$pwd\dist" installer\windows\PeakTime.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PeakTime-Windows
+          path: dist/*.exe
+
+  release:
+    needs: [macos, windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
